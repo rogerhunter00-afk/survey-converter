@@ -71,7 +71,7 @@
 <script>
 (function () {
   // =========================
-  // Wikidata "fun fact" panel
+  // Wikidata "fun fact" panel (FAST: MWAPI EntitySearch)
   // =========================
 
   var factTitleEl = document.getElementById('factTitle');
@@ -81,29 +81,20 @@
 
   var WDQS_ENDPOINT = "https://query.wikidata.org/sparql";
 
-  // ✅ Prefixes included; avoids WDQS parse errors
-  var SPARQL =
-"PREFIX schema: <http://schema.org/>\n" +
-"PREFIX wikibase: <http://wikiba.se/ontology#>\n" +
-"PREFIX bd: <http://www.bigdata.com/rdf#>\n" +
-"\n" +
-"SELECT ?item ?itemLabel ?itemDescription WHERE {\n" +
-"  ?item schema:description ?itemDescription .\n" +
-"  FILTER (lang(?itemDescription) = \"en\") .\n" +
-"  FILTER (\n" +
-"    CONTAINS(LCASE(STR(?itemDescription)), \"surveying instrument\") ||\n" +
-"    CONTAINS(LCASE(STR(?itemDescription)), \"land surveying\") ||\n" +
-"    CONTAINS(LCASE(STR(?itemDescription)), \"surveying\") ||\n" +
-"    CONTAINS(LCASE(STR(?itemDescription)), \"geodesy\") ||\n" +
-"    CONTAINS(LCASE(STR(?itemDescription)), \"topography\") ||\n" +
-"    CONTAINS(LCASE(STR(?itemDescription)), \"triangulation\")\n" +
-"  ) .\n" +
-"  SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". }\n" +
-"}\n" +
-"LIMIT 60\n";
+  // Always surveying-relevant search terms (Wikidata EntitySearch)
+  var TERMS = [
+    "surveying instrument",
+    "theodolite",
+    "total station",
+    "geodesy",
+    "triangulation (surveying)",
+    "level (surveying)",
+    "electronic distance measurement",
+    "land surveyor",
+    "Ordnance Survey"
+  ];
 
   function randInt(n) {
-    // crypto-random if available; fallback to Math.random
     if (window.crypto && window.crypto.getRandomValues) {
       var a = new Uint32Array(1);
       window.crypto.getRandomValues(a);
@@ -124,9 +115,32 @@
     factMetaEl.textContent = "Click “New fact” to retry.";
   }
 
-  function pickAndRenderFact(bindings) {
+  function buildSparqlForTerm(term) {
+    // Uses WDQS MWAPI service to call Wikidata EntitySearch (fast).
+    // Docs/examples: https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual/MWAPI
+    return (
+      "PREFIX wikibase: <http://wikiba.se/ontology#>\n" +
+      "PREFIX bd: <http://www.bigdata.com/rdf#>\n" +
+      "PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>\n" +
+      "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n" +
+      "\n" +
+      "SELECT ?item ?itemLabel ?itemDescription WHERE {\n" +
+      "  SERVICE wikibase:mwapi {\n" +
+      "    bd:serviceParam wikibase:endpoint \"www.wikidata.org\";\n" +
+      "                    wikibase:api \"EntitySearch\";\n" +
+      "                    mwapi:search \"" + term.replace(/"/g, '\\"') + "\";\n" +
+      "                    mwapi:language \"en\";\n" +
+      "                    mwapi:limit \"50\".\n" +
+      "    ?item wikibase:apiOutputItem mwapi:item.\n" +
+      "  }\n" +
+      "  SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". }\n" +
+      "}\n"
+    );
+  }
+
+  function pickAndRenderFact(bindings, term) {
     if (!bindings || !bindings.length) {
-      setFactError("No results returned from Wikidata Query Service.");
+      setFactError("No results returned for: " + term);
       return;
     }
 
@@ -137,16 +151,16 @@
     var desc    = (choice.itemDescription && choice.itemDescription.value) ? choice.itemDescription.value : "";
 
     factTitleEl.textContent = label;
-    factDescEl.textContent = desc;
+    factDescEl.textContent = desc || ("(No description) — term: " + term);
 
     var qid = itemUrl ? itemUrl.split("/").pop() : "";
     factMetaEl.innerHTML = itemUrl
-      ? ('Source: <a href="' + itemUrl + '" target="_blank" rel="noopener">Wikidata ' + qid + '</a>')
-      : "Source: Wikidata";
+      ? ('Term: <code>' + term + '</code> · Source: <a href="' + itemUrl + '" target="_blank" rel="noopener">Wikidata ' + qid + '</a>')
+      : ('Term: <code>' + term + '</code> · Source: Wikidata');
   }
 
   function fetchWithTimeout(url, options, timeoutMs) {
-    timeoutMs = timeoutMs || 8000;
+    timeoutMs = timeoutMs || 20000; // 20s
     if (window.AbortController) {
       var controller = new AbortController();
       var timer = setTimeout(function () { controller.abort(); }, timeoutMs);
@@ -161,18 +175,18 @@
         throw err;
       });
     }
-    // No AbortController support: plain fetch (best effort)
     return fetch(url, options);
   }
 
   function loadFact() {
+    var term = TERMS[randInt(TERMS.length)];
     setFactLoading("Loading…");
 
-    // Cache-buster helps avoid repeats due to caching
+    var sparql = buildSparqlForTerm(term);
     var cacheBuster = Date.now().toString(36) + Math.random().toString(36).slice(2);
-    var url = WDQS_ENDPOINT + "?format=json&query=" + encodeURIComponent(SPARQL) + "&cb=" + cacheBuster;
+    var url = WDQS_ENDPOINT + "?format=json&query=" + encodeURIComponent(sparql) + "&cb=" + cacheBuster;
 
-    fetchWithTimeout(url, { headers: { "Accept": "application/sparql-results+json" } }, 8000)
+    fetchWithTimeout(url, { headers: { "Accept": "application/sparql-results+json" } }, 20000)
       .then(function (res) {
         if (!res.ok) {
           return res.text().then(function (t) {
@@ -183,10 +197,12 @@
       })
       .then(function (data) {
         var bindings = data && data.results && data.results.bindings ? data.results.bindings : [];
-        pickAndRenderFact(bindings);
+        pickAndRenderFact(bindings, term);
       })
       .catch(function (e) {
-        var msg = (e && e.name === "AbortError") ? "Timed out contacting Wikidata (WDQS)." : String(e && e.message ? e.message : e);
+        var msg = (e && e.name === "AbortError")
+          ? "Timed out contacting Wikidata (WDQS)."
+          : String(e && e.message ? e.message : e);
         setFactError(msg);
         if (window.console && console.error) console.error(e);
       });
@@ -219,8 +235,6 @@
   }
 
   function filterPrintable(bytes) {
-    // Keep: tab(9), LF(10), CR(13), and ASCII 32..126
-    // Drop other binary/control bytes.
     var out = "";
     for (var i = 0; i < bytes.length; i++) {
       var b = bytes[i];
