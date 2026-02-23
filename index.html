@@ -74,7 +74,6 @@
   // =========================
   // Wikidata "fun fact" panel
   // =========================
-
   const factTitleEl = document.getElementById('factTitle');
   const factDescEl  = document.getElementById('factDesc');
   const factMetaEl  = document.getElementById('factMeta');
@@ -82,12 +81,12 @@
 
   const WDQS_ENDPOINT = "https://query.wikidata.org/sparql";
 
-  // Approach:
-  // - Ask WDQS for a small pool (LIMIT 60) of items whose English description strongly signals surveying relevance
-  // - Pick one randomly in JS (more reliably "different each time" than relying on ORDER BY RAND() alone)
-  //
-  // This is intentionally lightweight: label + description only.
+  // ✅ Includes required PREFIX declarations
   const SPARQL = `
+PREFIX schema: <http://schema.org/>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
 SELECT ?item ?itemLabel ?itemDescription WHERE {
   ?item schema:description ?itemDescription .
   FILTER (lang(?itemDescription) = "en") .
@@ -105,7 +104,6 @@ LIMIT 60
 `;
 
   function randInt(n) {
-    // cryptographically-strong random to reduce repeats across reloads
     const a = new Uint32Array(1);
     crypto.getRandomValues(a);
     return a[0] % n;
@@ -120,15 +118,14 @@ LIMIT 60
   function setFactError(msg) {
     factTitleEl.textContent = "Couldn’t load a fact";
     factDescEl.textContent = msg;
-    factMetaEl.textContent = "Try again in a moment.";
+    factMetaEl.textContent = "Click “New fact” to retry.";
   }
 
   function pickAndRenderFact(bindings) {
-    if (!bindings || !bindings.length) {
+    if (!bindings?.length) {
       setFactError("No results returned from Wikidata Query Service.");
       return;
     }
-
     const choice = bindings[randInt(bindings.length)];
     const itemUrl = choice.item?.value || "";
     const label = choice.itemLabel?.value || "Unknown item";
@@ -145,33 +142,40 @@ LIMIT 60
   async function loadFact() {
     setFactLoading();
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000); // 8s hard timeout
+
     try {
-      // Cache-buster makes "different each time" more consistent in real browsers / CDNs
       const cacheBuster = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const url = `${WDQS_ENDPOINT}?format=json&query=${encodeURIComponent(SPARQL)}&cb=${cacheBuster}`;
 
       const res = await fetch(url, {
-        headers: {
-          "Accept": "application/sparql-results+json"
-        }
+        signal: controller.signal,
+        headers: { "Accept": "application/sparql-results+json" }
       });
 
       if (!res.ok) {
-        throw new Error(`WDQS HTTP ${res.status}`);
+        // show a small snippet if WDQS returns an error payload
+        const text = await res.text().catch(() => "");
+        throw new Error(`WDQS HTTP ${res.status}${text ? " – " + text.slice(0, 160) : ""}`);
       }
 
       const data = await res.json();
-      const bindings = data?.results?.bindings || [];
-      pickAndRenderFact(bindings);
+      pickAndRenderFact(data?.results?.bindings || []);
     } catch (e) {
-      console.error(e);
-      setFactError(String(e?.message || e));
+      if (e?.name === "AbortError") {
+        setFactError("Timed out contacting Wikidata (WDQS).");
+      } else {
+        setFactError(String(e?.message || e));
+      }
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
   newFactBtn.addEventListener('click', loadFact);
-  // Load one on page open
   loadFact();
+})();
 
 
   // =========================
