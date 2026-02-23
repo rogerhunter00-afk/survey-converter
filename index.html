@@ -5,23 +5,17 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>SVW → ODB Converter (Survey Manager / Psion)</title>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 980px; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 900px; }
     h1 { margin: 0 0 8px; }
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; background: #fff; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     input[type="file"] { padding: 8px; }
     textarea { width: 100%; min-height: 220px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
     .muted { color: #666; }
     .ok { color: #0a7; }
     .warn { color: #b60; }
-    .small { font-size: 12px; color: #666; }
-    .factTitle { font-weight: 700; font-size: 16px; }
-    .factDesc { margin-top: 6px; }
-    .factMeta { margin-top: 10px; font-size: 12px; color: #666; }
-    a { color: inherit; }
-    code { background: #f6f6f6; padding: 1px 6px; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -31,22 +25,6 @@
     Runs entirely in your browser (no upload to a server).
   </div>
 
-  <!-- Fun surveying fact (Wikidata) -->
-  <div class="card" id="factCard">
-    <div class="row" style="justify-content: space-between; align-items: flex-start;">
-      <div>
-        <div class="muted" style="font-size:12px;">Random surveying fact (Wikidata)</div>
-        <div class="factTitle" id="factTitle">Loading…</div>
-        <div class="factDesc" id="factDesc"></div>
-        <div class="factMeta" id="factMeta"></div>
-      </div>
-      <div class="row">
-        <button id="newFact">New fact</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Converter -->
   <div class="card">
     <div class="row">
       <input id="file" type="file" accept=".svw,.SVW,.odb,.ODB,.txt" />
@@ -54,190 +32,47 @@
       <button id="download" disabled>Download .ODB</button>
     </div>
     <div id="status" class="muted" style="margin-top:10px;">Select an .SVW file to begin.</div>
-    <div class="small" style="margin-top:8px;">
-      Extracts only: <code>LINE;...;</code>, <code>ANN;T='...';</code>, <code>GET ...;</code> and writes one per line (CRLF).
-      (Validated against your TENFAC1–4 edited ODBs.)
-    </div>
   </div>
 
   <div class="card">
     <div class="row" style="justify-content: space-between;">
-      <div><strong>Preview (first 300 tokens)</strong></div>
+      <div><strong>Preview (first 300 lines)</strong></div>
       <div class="muted" id="counts"></div>
     </div>
     <textarea id="preview" readonly placeholder="Converted output will appear here..."></textarea>
   </div>
 
 <script>
-(function () {
-  // =========================
-  // Wikidata "fun fact" panel (FAST: MWAPI EntitySearch)
-  // =========================
+(() => {
+  const fileInput = document.getElementById('file');
+  const btnConvert = document.getElementById('convert');
+  const btnDownload = document.getElementById('download');
+  const statusEl = document.getElementById('status');
+  const previewEl = document.getElementById('preview');
+  const countsEl = document.getElementById('counts');
 
-  var factTitleEl = document.getElementById('factTitle');
-  var factDescEl  = document.getElementById('factDesc');
-  var factMetaEl  = document.getElementById('factMeta');
-  var newFactBtn  = document.getElementById('newFact');
+  let lastOutput = "";
+  let lastOutName = "output.odb";
 
-  var WDQS_ENDPOINT = "https://query.wikidata.org/sparql";
+  // Same token logic as the Python script:
+  // - LINE;...;
+  // - ANN;T='...';
+  // - GET ...;
+  // Notes:
+  //  * LINE pattern is conservative: it matches up to the next semicolon.
+  //    If you later find LINE payloads can include semicolons, we can widen it.
+  const TOKEN_RE = /(LINE;[^;\r\n]*;|ANN;T='[^']*';|GET [^;\r\n]*;)/g;
 
-  // Always surveying-relevant search terms (Wikidata EntitySearch)
-  var TERMS = [
-    "surveying instrument",
-    "theodolite",
-    "total station",
-    "geodesy",
-    "triangulation (surveying)",
-    "level (surveying)",
-    "electronic distance measurement",
-    "land surveyor",
-    "Ordnance Survey"
-  ];
-
-  function randInt(n) {
-    if (window.crypto && window.crypto.getRandomValues) {
-      var a = new Uint32Array(1);
-      window.crypto.getRandomValues(a);
-      return a[0] % n;
-    }
-    return Math.floor(Math.random() * n);
-  }
-
-  function setFactLoading(msg) {
-    factTitleEl.textContent = msg || "Loading…";
-    factDescEl.textContent = "";
-    factMetaEl.textContent = "";
-  }
-
-  function setFactError(msg) {
-    factTitleEl.textContent = "Couldn’t load a fact";
-    factDescEl.textContent = msg || "Unknown error";
-    factMetaEl.textContent = "Click “New fact” to retry.";
-  }
-
-  function buildSparqlForTerm(term) {
-    // Uses WDQS MWAPI service to call Wikidata EntitySearch (fast).
-    // Docs/examples: https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual/MWAPI
-    return (
-      "PREFIX wikibase: <http://wikiba.se/ontology#>\n" +
-      "PREFIX bd: <http://www.bigdata.com/rdf#>\n" +
-      "PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>\n" +
-      "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n" +
-      "\n" +
-      "SELECT ?item ?itemLabel ?itemDescription WHERE {\n" +
-      "  SERVICE wikibase:mwapi {\n" +
-      "    bd:serviceParam wikibase:endpoint \"www.wikidata.org\";\n" +
-      "                    wikibase:api \"EntitySearch\";\n" +
-      "                    mwapi:search \"" + term.replace(/"/g, '\\"') + "\";\n" +
-      "                    mwapi:language \"en\";\n" +
-      "                    mwapi:limit \"50\".\n" +
-      "    ?item wikibase:apiOutputItem mwapi:item.\n" +
-      "  }\n" +
-      "  SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". }\n" +
-      "}\n"
-    );
-  }
-
-  function pickAndRenderFact(bindings, term) {
-    if (!bindings || !bindings.length) {
-      setFactError("No results returned for: " + term);
-      return;
-    }
-
-    var choice = bindings[randInt(bindings.length)];
-
-    var itemUrl = (choice.item && choice.item.value) ? choice.item.value : "";
-    var label   = (choice.itemLabel && choice.itemLabel.value) ? choice.itemLabel.value : "Unknown item";
-    var desc    = (choice.itemDescription && choice.itemDescription.value) ? choice.itemDescription.value : "";
-
-    factTitleEl.textContent = label;
-    factDescEl.textContent = desc || ("(No description) — term: " + term);
-
-    var qid = itemUrl ? itemUrl.split("/").pop() : "";
-    factMetaEl.innerHTML = itemUrl
-      ? ('Term: <code>' + term + '</code> · Source: <a href="' + itemUrl + '" target="_blank" rel="noopener">Wikidata ' + qid + '</a>')
-      : ('Term: <code>' + term + '</code> · Source: Wikidata');
-  }
-
-  function fetchWithTimeout(url, options, timeoutMs) {
-    timeoutMs = timeoutMs || 20000; // 20s
-    if (window.AbortController) {
-      var controller = new AbortController();
-      var timer = setTimeout(function () { controller.abort(); }, timeoutMs);
-      options = options || {};
-      options.signal = controller.signal;
-
-      return fetch(url, options).then(function (res) {
-        clearTimeout(timer);
-        return res;
-      }).catch(function (err) {
-        clearTimeout(timer);
-        throw err;
-      });
-    }
-    return fetch(url, options);
-  }
-
-  function loadFact() {
-    var term = TERMS[randInt(TERMS.length)];
-    setFactLoading("Loading…");
-
-    var sparql = buildSparqlForTerm(term);
-    var cacheBuster = Date.now().toString(36) + Math.random().toString(36).slice(2);
-    var url = WDQS_ENDPOINT + "?format=json&query=" + encodeURIComponent(sparql) + "&cb=" + cacheBuster;
-
-    fetchWithTimeout(url, { headers: { "Accept": "application/sparql-results+json" } }, 20000)
-      .then(function (res) {
-        if (!res.ok) {
-          return res.text().then(function (t) {
-            throw new Error("WDQS HTTP " + res.status + (t ? " – " + t.slice(0, 160) : ""));
-          });
-        }
-        return res.json();
-      })
-      .then(function (data) {
-        var bindings = data && data.results && data.results.bindings ? data.results.bindings : [];
-        pickAndRenderFact(bindings, term);
-      })
-      .catch(function (e) {
-        var msg = (e && e.name === "AbortError")
-          ? "Timed out contacting Wikidata (WDQS)."
-          : String(e && e.message ? e.message : e);
-        setFactError(msg);
-        if (window.console && console.error) console.error(e);
-      });
-  }
-
-  if (newFactBtn) newFactBtn.addEventListener('click', loadFact);
-  loadFact();
-
-
-  // =========================
-  // SVW → ODB converter
-  // =========================
-
-  var fileInput = document.getElementById('file');
-  var btnConvert = document.getElementById('convert');
-  var btnDownload = document.getElementById('download');
-  var statusEl = document.getElementById('status');
-  var previewEl = document.getElementById('preview');
-  var countsEl = document.getElementById('counts');
-
-  var lastOutput = "";
-  var lastOutName = "output.odb";
-
-  // ✅ Validated against your EditedTENFAC1–4.ODB
-  var TOKEN_RE = /(LINE;[^;\r\n]*;|ANN;T='[^']*';|GET [^;\r\n]*;)/g;
-
-  function setStatus(msg, cls) {
-    statusEl.className = cls || "muted";
+  function setStatus(msg, cls="muted") {
+    statusEl.className = cls;
     statusEl.textContent = msg;
   }
 
   function filterPrintable(bytes) {
-    var out = "";
-    for (var i = 0; i < bytes.length; i++) {
-      var b = bytes[i];
+    // Keep: tab(9), LF(10), CR(13), and ASCII 32..126
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i];
       if (b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126)) {
         out += String.fromCharCode(b);
       }
@@ -246,15 +81,15 @@
   }
 
   function extractTokens(text) {
-    var m = text.match(TOKEN_RE);
-    return m ? m : [];
+    const tokens = text.match(TOKEN_RE) || [];
+    return tokens;
   }
 
   function makeCRLF(lines) {
     return lines.join("\r\n") + "\r\n";
   }
 
-  fileInput.addEventListener('change', function () {
+  fileInput.addEventListener('change', () => {
     btnConvert.disabled = !(fileInput.files && fileInput.files.length);
     btnDownload.disabled = true;
     previewEl.value = "";
@@ -263,22 +98,24 @@
     if (btnConvert.disabled) {
       setStatus("Select an .SVW file to begin.", "muted");
     } else {
-      setStatus("Selected: " + fileInput.files[0].name, "muted");
+      setStatus(`Selected: ${fileInput.files[0].name}`, "muted");
     }
   });
 
-  btnConvert.addEventListener('click', function () {
-    var f = fileInput.files && fileInput.files[0];
+  btnConvert.addEventListener('click', async () => {
+    const f = fileInput.files?.[0];
     if (!f) return;
 
     setStatus("Reading file…", "muted");
     btnConvert.disabled = true;
     btnDownload.disabled = true;
 
-    f.arrayBuffer().then(function (buf) {
-      var bytes = new Uint8Array(buf);
-      var printable = filterPrintable(bytes);
-      var tokens = extractTokens(printable);
+    try {
+      const buf = await f.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+
+      const printable = filterPrintable(bytes);
+      const tokens = extractTokens(printable);
 
       if (!tokens.length) {
         setStatus("No LINE/ANN/GET tokens found. This file may not be the expected SVW format.", "warn");
@@ -286,33 +123,35 @@
         return;
       }
 
-      var out = makeCRLF(tokens);
+      const out = makeCRLF(tokens);
       lastOutput = out;
 
-      var base = f.name.replace(/\.[^/.]+$/,"");
-      lastOutName = base + ".ODB";
+      // output name: input base + .ODB
+      const base = f.name.replace(/\.[^/.]+$/,"");
+      lastOutName = `${base}.ODB`;
 
-      var lines = tokens.slice(0, 300);
+      // preview first 300 lines
+      const lines = tokens.slice(0, 300);
       previewEl.value = lines.join("\r\n") + (tokens.length > 300 ? "\r\n… (truncated preview)" : "");
 
-      countsEl.textContent = "Tokens: " + tokens.length.toLocaleString() + " | Output: " + out.length.toLocaleString() + " chars";
-      setStatus("Converted OK → " + lastOutName, "ok");
+      countsEl.textContent = `Tokens: ${tokens.length} | Output: ${out.length.toLocaleString()} chars`;
+      setStatus(`Converted OK → ${lastOutName}`, "ok");
       btnDownload.disabled = false;
+    } catch (e) {
+      console.error(e);
+      setStatus(`Error: ${e?.message || e}`, "warn");
+    } finally {
       btnConvert.disabled = false;
-    }).catch(function (e) {
-      if (window.console && console.error) console.error(e);
-      setStatus("Error: " + String(e && e.message ? e.message : e), "warn");
-      btnConvert.disabled = false;
-    });
+    }
   });
 
-  btnDownload.addEventListener('click', function () {
+  btnDownload.addEventListener('click', () => {
     if (!lastOutput) return;
 
-    var blob = new Blob([lastOutput], { type: "text/plain;charset=ascii" });
-    var url = URL.createObjectURL(blob);
+    const blob = new Blob([lastOutput], { type: "text/plain;charset=ascii" });
+    const url = URL.createObjectURL(blob);
 
-    var a = document.createElement('a');
+    const a = document.createElement('a');
     a.href = url;
     a.download = lastOutName;
     document.body.appendChild(a);
