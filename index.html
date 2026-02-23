@@ -20,7 +20,6 @@
     .factTitle { font-weight: 700; font-size: 16px; }
     .factDesc { margin-top: 6px; }
     .factMeta { margin-top: 10px; font-size: 12px; color: #666; }
-    .spacer { height: 2px; }
     a { color: inherit; }
     code { background: #f6f6f6; padding: 1px 6px; border-radius: 8px; }
   </style>
@@ -70,142 +69,161 @@
   </div>
 
 <script>
-(() => {
+(function () {
   // =========================
   // Wikidata "fun fact" panel
   // =========================
-  const factTitleEl = document.getElementById('factTitle');
-  const factDescEl  = document.getElementById('factDesc');
-  const factMetaEl  = document.getElementById('factMeta');
-  const newFactBtn  = document.getElementById('newFact');
 
-  const WDQS_ENDPOINT = "https://query.wikidata.org/sparql";
+  var factTitleEl = document.getElementById('factTitle');
+  var factDescEl  = document.getElementById('factDesc');
+  var factMetaEl  = document.getElementById('factMeta');
+  var newFactBtn  = document.getElementById('newFact');
 
-  // ✅ Includes required PREFIX declarations
-  const SPARQL = `
-PREFIX schema: <http://schema.org/>
-PREFIX wikibase: <http://wikiba.se/ontology#>
-PREFIX bd: <http://www.bigdata.com/rdf#>
+  var WDQS_ENDPOINT = "https://query.wikidata.org/sparql";
 
-SELECT ?item ?itemLabel ?itemDescription WHERE {
-  ?item schema:description ?itemDescription .
-  FILTER (lang(?itemDescription) = "en") .
-  FILTER (
-    CONTAINS(LCASE(STR(?itemDescription)), "surveying instrument") ||
-    CONTAINS(LCASE(STR(?itemDescription)), "land surveying") ||
-    CONTAINS(LCASE(STR(?itemDescription)), "surveying") ||
-    CONTAINS(LCASE(STR(?itemDescription)), "geodesy") ||
-    CONTAINS(LCASE(STR(?itemDescription)), "topography") ||
-    CONTAINS(LCASE(STR(?itemDescription)), "triangulation")
-  ) .
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-}
-LIMIT 60
-`;
+  // ✅ Prefixes included; avoids WDQS parse errors
+  var SPARQL =
+"PREFIX schema: <http://schema.org/>\n" +
+"PREFIX wikibase: <http://wikiba.se/ontology#>\n" +
+"PREFIX bd: <http://www.bigdata.com/rdf#>\n" +
+"\n" +
+"SELECT ?item ?itemLabel ?itemDescription WHERE {\n" +
+"  ?item schema:description ?itemDescription .\n" +
+"  FILTER (lang(?itemDescription) = \"en\") .\n" +
+"  FILTER (\n" +
+"    CONTAINS(LCASE(STR(?itemDescription)), \"surveying instrument\") ||\n" +
+"    CONTAINS(LCASE(STR(?itemDescription)), \"land surveying\") ||\n" +
+"    CONTAINS(LCASE(STR(?itemDescription)), \"surveying\") ||\n" +
+"    CONTAINS(LCASE(STR(?itemDescription)), \"geodesy\") ||\n" +
+"    CONTAINS(LCASE(STR(?itemDescription)), \"topography\") ||\n" +
+"    CONTAINS(LCASE(STR(?itemDescription)), \"triangulation\")\n" +
+"  ) .\n" +
+"  SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". }\n" +
+"}\n" +
+"LIMIT 60\n";
 
   function randInt(n) {
-    const a = new Uint32Array(1);
-    crypto.getRandomValues(a);
-    return a[0] % n;
+    // crypto-random if available; fallback to Math.random
+    if (window.crypto && window.crypto.getRandomValues) {
+      var a = new Uint32Array(1);
+      window.crypto.getRandomValues(a);
+      return a[0] % n;
+    }
+    return Math.floor(Math.random() * n);
   }
 
-  function setFactLoading(msg = "Loading…") {
-    factTitleEl.textContent = msg;
+  function setFactLoading(msg) {
+    factTitleEl.textContent = msg || "Loading…";
     factDescEl.textContent = "";
     factMetaEl.textContent = "";
   }
 
   function setFactError(msg) {
     factTitleEl.textContent = "Couldn’t load a fact";
-    factDescEl.textContent = msg;
+    factDescEl.textContent = msg || "Unknown error";
     factMetaEl.textContent = "Click “New fact” to retry.";
   }
 
   function pickAndRenderFact(bindings) {
-    if (!bindings?.length) {
+    if (!bindings || !bindings.length) {
       setFactError("No results returned from Wikidata Query Service.");
       return;
     }
-    const choice = bindings[randInt(bindings.length)];
-    const itemUrl = choice.item?.value || "";
-    const label = choice.itemLabel?.value || "Unknown item";
-    const desc  = choice.itemDescription?.value || "";
+
+    var choice = bindings[randInt(bindings.length)];
+
+    var itemUrl = (choice.item && choice.item.value) ? choice.item.value : "";
+    var label   = (choice.itemLabel && choice.itemLabel.value) ? choice.itemLabel.value : "Unknown item";
+    var desc    = (choice.itemDescription && choice.itemDescription.value) ? choice.itemDescription.value : "";
 
     factTitleEl.textContent = label;
     factDescEl.textContent = desc;
 
-    const qid = itemUrl.split("/").pop();
-    factMetaEl.innerHTML =
-      `Source: <a href="${itemUrl}" target="_blank" rel="noopener">Wikidata ${qid || ""}</a>`;
+    var qid = itemUrl ? itemUrl.split("/").pop() : "";
+    factMetaEl.innerHTML = itemUrl
+      ? ('Source: <a href="' + itemUrl + '" target="_blank" rel="noopener">Wikidata ' + qid + '</a>')
+      : "Source: Wikidata";
   }
 
-  async function loadFact() {
-    setFactLoading();
+  function fetchWithTimeout(url, options, timeoutMs) {
+    timeoutMs = timeoutMs || 8000;
+    if (window.AbortController) {
+      var controller = new AbortController();
+      var timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+      options = options || {};
+      options.signal = controller.signal;
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000); // 8s hard timeout
-
-    try {
-      const cacheBuster = Date.now().toString(36) + Math.random().toString(36).slice(2);
-      const url = `${WDQS_ENDPOINT}?format=json&query=${encodeURIComponent(SPARQL)}&cb=${cacheBuster}`;
-
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { "Accept": "application/sparql-results+json" }
+      return fetch(url, options).then(function (res) {
+        clearTimeout(timer);
+        return res;
+      }).catch(function (err) {
+        clearTimeout(timer);
+        throw err;
       });
-
-      if (!res.ok) {
-        // show a small snippet if WDQS returns an error payload
-        const text = await res.text().catch(() => "");
-        throw new Error(`WDQS HTTP ${res.status}${text ? " – " + text.slice(0, 160) : ""}`);
-      }
-
-      const data = await res.json();
-      pickAndRenderFact(data?.results?.bindings || []);
-    } catch (e) {
-      if (e?.name === "AbortError") {
-        setFactError("Timed out contacting Wikidata (WDQS).");
-      } else {
-        setFactError(String(e?.message || e));
-      }
-    } finally {
-      clearTimeout(timeout);
     }
+    // No AbortController support: plain fetch (best effort)
+    return fetch(url, options);
   }
 
-  newFactBtn.addEventListener('click', loadFact);
+  function loadFact() {
+    setFactLoading("Loading…");
+
+    // Cache-buster helps avoid repeats due to caching
+    var cacheBuster = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    var url = WDQS_ENDPOINT + "?format=json&query=" + encodeURIComponent(SPARQL) + "&cb=" + cacheBuster;
+
+    fetchWithTimeout(url, { headers: { "Accept": "application/sparql-results+json" } }, 8000)
+      .then(function (res) {
+        if (!res.ok) {
+          return res.text().then(function (t) {
+            throw new Error("WDQS HTTP " + res.status + (t ? " – " + t.slice(0, 160) : ""));
+          });
+        }
+        return res.json();
+      })
+      .then(function (data) {
+        var bindings = data && data.results && data.results.bindings ? data.results.bindings : [];
+        pickAndRenderFact(bindings);
+      })
+      .catch(function (e) {
+        var msg = (e && e.name === "AbortError") ? "Timed out contacting Wikidata (WDQS)." : String(e && e.message ? e.message : e);
+        setFactError(msg);
+        if (window.console && console.error) console.error(e);
+      });
+  }
+
+  if (newFactBtn) newFactBtn.addEventListener('click', loadFact);
   loadFact();
-})();
 
 
   // =========================
   // SVW → ODB converter
   // =========================
 
-  const fileInput = document.getElementById('file');
-  const btnConvert = document.getElementById('convert');
-  const btnDownload = document.getElementById('download');
-  const statusEl = document.getElementById('status');
-  const previewEl = document.getElementById('preview');
-  const countsEl = document.getElementById('counts');
+  var fileInput = document.getElementById('file');
+  var btnConvert = document.getElementById('convert');
+  var btnDownload = document.getElementById('download');
+  var statusEl = document.getElementById('status');
+  var previewEl = document.getElementById('preview');
+  var countsEl = document.getElementById('counts');
 
-  let lastOutput = "";
-  let lastOutName = "output.odb";
+  var lastOutput = "";
+  var lastOutName = "output.odb";
 
   // ✅ Validated against your EditedTENFAC1–4.ODB
-  const TOKEN_RE = /(LINE;[^;\r\n]*;|ANN;T='[^']*';|GET [^;\r\n]*;)/g;
+  var TOKEN_RE = /(LINE;[^;\r\n]*;|ANN;T='[^']*';|GET [^;\r\n]*;)/g;
 
-  function setStatus(msg, cls="muted") {
-    statusEl.className = cls;
+  function setStatus(msg, cls) {
+    statusEl.className = cls || "muted";
     statusEl.textContent = msg;
   }
 
   function filterPrintable(bytes) {
     // Keep: tab(9), LF(10), CR(13), and ASCII 32..126
     // Drop other binary/control bytes.
-    let out = "";
-    for (let i = 0; i < bytes.length; i++) {
-      const b = bytes[i];
+    var out = "";
+    for (var i = 0; i < bytes.length; i++) {
+      var b = bytes[i];
       if (b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126)) {
         out += String.fromCharCode(b);
       }
@@ -214,14 +232,15 @@ LIMIT 60
   }
 
   function extractTokens(text) {
-    return text.match(TOKEN_RE) || [];
+    var m = text.match(TOKEN_RE);
+    return m ? m : [];
   }
 
   function makeCRLF(lines) {
     return lines.join("\r\n") + "\r\n";
   }
 
-  fileInput.addEventListener('change', () => {
+  fileInput.addEventListener('change', function () {
     btnConvert.disabled = !(fileInput.files && fileInput.files.length);
     btnDownload.disabled = true;
     previewEl.value = "";
@@ -230,24 +249,22 @@ LIMIT 60
     if (btnConvert.disabled) {
       setStatus("Select an .SVW file to begin.", "muted");
     } else {
-      setStatus(`Selected: ${fileInput.files[0].name}`, "muted");
+      setStatus("Selected: " + fileInput.files[0].name, "muted");
     }
   });
 
-  btnConvert.addEventListener('click', async () => {
-    const f = fileInput.files?.[0];
+  btnConvert.addEventListener('click', function () {
+    var f = fileInput.files && fileInput.files[0];
     if (!f) return;
 
     setStatus("Reading file…", "muted");
     btnConvert.disabled = true;
     btnDownload.disabled = true;
 
-    try {
-      const buf = await f.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-
-      const printable = filterPrintable(bytes);
-      const tokens = extractTokens(printable);
+    f.arrayBuffer().then(function (buf) {
+      var bytes = new Uint8Array(buf);
+      var printable = filterPrintable(bytes);
+      var tokens = extractTokens(printable);
 
       if (!tokens.length) {
         setStatus("No LINE/ANN/GET tokens found. This file may not be the expected SVW format.", "warn");
@@ -255,33 +272,33 @@ LIMIT 60
         return;
       }
 
-      const out = makeCRLF(tokens);
+      var out = makeCRLF(tokens);
       lastOutput = out;
 
-      const base = f.name.replace(/\.[^/.]+$/,"");
-      lastOutName = `${base}.ODB`;
+      var base = f.name.replace(/\.[^/.]+$/,"");
+      lastOutName = base + ".ODB";
 
-      const lines = tokens.slice(0, 300);
+      var lines = tokens.slice(0, 300);
       previewEl.value = lines.join("\r\n") + (tokens.length > 300 ? "\r\n… (truncated preview)" : "");
 
-      countsEl.textContent = `Tokens: ${tokens.length.toLocaleString()} | Output: ${out.length.toLocaleString()} chars`;
-      setStatus(`Converted OK → ${lastOutName}`, "ok");
+      countsEl.textContent = "Tokens: " + tokens.length.toLocaleString() + " | Output: " + out.length.toLocaleString() + " chars";
+      setStatus("Converted OK → " + lastOutName, "ok");
       btnDownload.disabled = false;
-    } catch (e) {
-      console.error(e);
-      setStatus(`Error: ${e?.message || e}`, "warn");
-    } finally {
       btnConvert.disabled = false;
-    }
+    }).catch(function (e) {
+      if (window.console && console.error) console.error(e);
+      setStatus("Error: " + String(e && e.message ? e.message : e), "warn");
+      btnConvert.disabled = false;
+    });
   });
 
-  btnDownload.addEventListener('click', () => {
+  btnDownload.addEventListener('click', function () {
     if (!lastOutput) return;
 
-    const blob = new Blob([lastOutput], { type: "text/plain;charset=ascii" });
-    const url = URL.createObjectURL(blob);
+    var blob = new Blob([lastOutput], { type: "text/plain;charset=ascii" });
+    var url = URL.createObjectURL(blob);
 
-    const a = document.createElement('a');
+    var a = document.createElement('a');
     a.href = url;
     a.download = lastOutName;
     document.body.appendChild(a);
