@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SVW → ODB Converter (Survey Manager / Psion)</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 900px; }
+    h1 { margin: 0 0 8px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input[type="file"] { padding: 8px; }
+    textarea { width: 100%; min-height: 220px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+    .muted { color: #666; }
+    .ok { color: #0a7; }
+    .warn { color: #b60; }
+  </style>
+</head>
+<body>
+  <h1>SVW → ODB Converter</h1>
+  <div class="muted">
+    Converts legacy Survey Manager / Psion SVW exports into importer-ready ODB text.
+    Runs entirely in your browser (no upload to a server).
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="file" type="file" accept=".svw,.SVW,.odb,.ODB,.txt" />
+      <button id="convert" disabled>Convert</button>
+      <button id="download" disabled>Download .ODB</button>
+    </div>
+    <div id="status" class="muted" style="margin-top:10px;">Select an .SVW file to begin.</div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content: space-between;">
+      <div><strong>Preview (first 300 lines)</strong></div>
+      <div class="muted" id="counts"></div>
+    </div>
+    <textarea id="preview" readonly placeholder="Converted output will appear here..."></textarea>
+  </div>
+
+<script>
+(() => {
+  const fileInput = document.getElementById('file');
+  const btnConvert = document.getElementById('convert');
+  const btnDownload = document.getElementById('download');
+  const statusEl = document.getElementById('status');
+  const previewEl = document.getElementById('preview');
+  const countsEl = document.getElementById('counts');
+
+  let lastOutput = "";
+  let lastOutName = "output.odb";
+
+  // Same token logic as the Python script:
+  // - LINE;...;
+  // - ANN;T='...';
+  // - GET ...;
+  // Notes:
+  //  * LINE pattern is conservative: it matches up to the next semicolon.
+  //    If you later find LINE payloads can include semicolons, we can widen it.
+  const TOKEN_RE = /(LINE;[^;\r\n]*;|ANN;T='[^']*';|GET [^;\r\n]*;)/g;
+
+  function setStatus(msg, cls="muted") {
+    statusEl.className = cls;
+    statusEl.textContent = msg;
+  }
+
+  function filterPrintable(bytes) {
+    // Keep: tab(9), LF(10), CR(13), and ASCII 32..126
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i];
+      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126)) {
+        out += String.fromCharCode(b);
+      }
+    }
+    return out;
+  }
+
+  function extractTokens(text) {
+    const tokens = text.match(TOKEN_RE) || [];
+    return tokens;
+  }
+
+  function makeCRLF(lines) {
+    return lines.join("\r\n") + "\r\n";
+  }
+
+  fileInput.addEventListener('change', () => {
+    btnConvert.disabled = !(fileInput.files && fileInput.files.length);
+    btnDownload.disabled = true;
+    previewEl.value = "";
+    countsEl.textContent = "";
+    lastOutput = "";
+    if (btnConvert.disabled) {
+      setStatus("Select an .SVW file to begin.", "muted");
+    } else {
+      setStatus(`Selected: ${fileInput.files[0].name}`, "muted");
+    }
+  });
+
+  btnConvert.addEventListener('click', async () => {
+    const f = fileInput.files?.[0];
+    if (!f) return;
+
+    setStatus("Reading file…", "muted");
+    btnConvert.disabled = true;
+    btnDownload.disabled = true;
+
+    try {
+      const buf = await f.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+
+      const printable = filterPrintable(bytes);
+      const tokens = extractTokens(printable);
+
+      if (!tokens.length) {
+        setStatus("No LINE/ANN/GET tokens found. This file may not be the expected SVW format.", "warn");
+        btnConvert.disabled = false;
+        return;
+      }
+
+      const out = makeCRLF(tokens);
+      lastOutput = out;
+
+      // output name: input base + .ODB
+      const base = f.name.replace(/\.[^/.]+$/,"");
+      lastOutName = `${base}.ODB`;
+
+      // preview first 300 lines
+      const lines = tokens.slice(0, 300);
+      previewEl.value = lines.join("\r\n") + (tokens.length > 300 ? "\r\n… (truncated preview)" : "");
+
+      countsEl.textContent = `Tokens: ${tokens.length} | Output: ${out.length.toLocaleString()} chars`;
+      setStatus(`Converted OK → ${lastOutName}`, "ok");
+      btnDownload.disabled = false;
+    } catch (e) {
+      console.error(e);
+      setStatus(`Error: ${e?.message || e}`, "warn");
+    } finally {
+      btnConvert.disabled = false;
+    }
+  });
+
+  btnDownload.addEventListener('click', () => {
+    if (!lastOutput) return;
+
+    const blob = new Blob([lastOutput], { type: "text/plain;charset=ascii" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = lastOutName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>
