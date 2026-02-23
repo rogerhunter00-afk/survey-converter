@@ -5,17 +5,24 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>SVW → ODB Converter (Survey Manager / Psion)</title>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 900px; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 980px; }
     h1 { margin: 0 0 8px; }
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; background: #fff; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     input[type="file"] { padding: 8px; }
     textarea { width: 100%; min-height: 220px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
     .muted { color: #666; }
     .ok { color: #0a7; }
     .warn { color: #b60; }
+    .small { font-size: 12px; color: #666; }
+    .factTitle { font-weight: 700; font-size: 16px; }
+    .factDesc { margin-top: 6px; }
+    .factMeta { margin-top: 10px; font-size: 12px; color: #666; }
+    .spacer { height: 2px; }
+    a { color: inherit; }
+    code { background: #f6f6f6; padding: 1px 6px; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -25,6 +32,22 @@
     Runs entirely in your browser (no upload to a server).
   </div>
 
+  <!-- Fun surveying fact (Wikidata) -->
+  <div class="card" id="factCard">
+    <div class="row" style="justify-content: space-between; align-items: flex-start;">
+      <div>
+        <div class="muted" style="font-size:12px;">Random surveying fact (Wikidata)</div>
+        <div class="factTitle" id="factTitle">Loading…</div>
+        <div class="factDesc" id="factDesc"></div>
+        <div class="factMeta" id="factMeta"></div>
+      </div>
+      <div class="row">
+        <button id="newFact">New fact</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Converter -->
   <div class="card">
     <div class="row">
       <input id="file" type="file" accept=".svw,.SVW,.odb,.ODB,.txt" />
@@ -32,11 +55,15 @@
       <button id="download" disabled>Download .ODB</button>
     </div>
     <div id="status" class="muted" style="margin-top:10px;">Select an .SVW file to begin.</div>
+    <div class="small" style="margin-top:8px;">
+      Extracts only: <code>LINE;...;</code>, <code>ANN;T='...';</code>, <code>GET ...;</code> and writes one per line (CRLF).
+      (Validated against your TENFAC1–4 edited ODBs.)
+    </div>
   </div>
 
   <div class="card">
     <div class="row" style="justify-content: space-between;">
-      <div><strong>Preview (first 300 lines)</strong></div>
+      <div><strong>Preview (first 300 tokens)</strong></div>
       <div class="muted" id="counts"></div>
     </div>
     <textarea id="preview" readonly placeholder="Converted output will appear here..."></textarea>
@@ -44,6 +71,113 @@
 
 <script>
 (() => {
+  // =========================
+  // Wikidata "fun fact" panel
+  // =========================
+
+  const factTitleEl = document.getElementById('factTitle');
+  const factDescEl  = document.getElementById('factDesc');
+  const factMetaEl  = document.getElementById('factMeta');
+  const newFactBtn  = document.getElementById('newFact');
+
+  const WDQS_ENDPOINT = "https://query.wikidata.org/sparql";
+
+  // Approach:
+  // - Ask WDQS for a small pool (LIMIT 60) of items whose English description strongly signals surveying relevance
+  // - Pick one randomly in JS (more reliably "different each time" than relying on ORDER BY RAND() alone)
+  //
+  // This is intentionally lightweight: label + description only.
+  const SPARQL = `
+SELECT ?item ?itemLabel ?itemDescription WHERE {
+  ?item schema:description ?itemDescription .
+  FILTER (lang(?itemDescription) = "en") .
+  FILTER (
+    CONTAINS(LCASE(STR(?itemDescription)), "surveying instrument") ||
+    CONTAINS(LCASE(STR(?itemDescription)), "land surveying") ||
+    CONTAINS(LCASE(STR(?itemDescription)), "surveying") ||
+    CONTAINS(LCASE(STR(?itemDescription)), "geodesy") ||
+    CONTAINS(LCASE(STR(?itemDescription)), "topography") ||
+    CONTAINS(LCASE(STR(?itemDescription)), "triangulation")
+  ) .
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+}
+LIMIT 60
+`;
+
+  function randInt(n) {
+    // cryptographically-strong random to reduce repeats across reloads
+    const a = new Uint32Array(1);
+    crypto.getRandomValues(a);
+    return a[0] % n;
+  }
+
+  function setFactLoading(msg = "Loading…") {
+    factTitleEl.textContent = msg;
+    factDescEl.textContent = "";
+    factMetaEl.textContent = "";
+  }
+
+  function setFactError(msg) {
+    factTitleEl.textContent = "Couldn’t load a fact";
+    factDescEl.textContent = msg;
+    factMetaEl.textContent = "Try again in a moment.";
+  }
+
+  function pickAndRenderFact(bindings) {
+    if (!bindings || !bindings.length) {
+      setFactError("No results returned from Wikidata Query Service.");
+      return;
+    }
+
+    const choice = bindings[randInt(bindings.length)];
+    const itemUrl = choice.item?.value || "";
+    const label = choice.itemLabel?.value || "Unknown item";
+    const desc  = choice.itemDescription?.value || "";
+
+    factTitleEl.textContent = label;
+    factDescEl.textContent = desc;
+
+    const qid = itemUrl.split("/").pop();
+    factMetaEl.innerHTML =
+      `Source: <a href="${itemUrl}" target="_blank" rel="noopener">Wikidata ${qid || ""}</a>`;
+  }
+
+  async function loadFact() {
+    setFactLoading();
+
+    try {
+      // Cache-buster makes "different each time" more consistent in real browsers / CDNs
+      const cacheBuster = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const url = `${WDQS_ENDPOINT}?format=json&query=${encodeURIComponent(SPARQL)}&cb=${cacheBuster}`;
+
+      const res = await fetch(url, {
+        headers: {
+          "Accept": "application/sparql-results+json"
+        }
+      });
+
+      if (!res.ok) {
+        throw new Error(`WDQS HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const bindings = data?.results?.bindings || [];
+      pickAndRenderFact(bindings);
+    } catch (e) {
+      console.error(e);
+      setFactError(String(e?.message || e));
+    }
+  }
+
+  newFactBtn.addEventListener('click', loadFact);
+  // Load one on page open
+  loadFact();
+
+
+  // =========================
+  // SVW → ODB converter
+  // =========================
+
   const fileInput = document.getElementById('file');
   const btnConvert = document.getElementById('convert');
   const btnDownload = document.getElementById('download');
@@ -54,13 +188,7 @@
   let lastOutput = "";
   let lastOutName = "output.odb";
 
-  // Same token logic as the Python script:
-  // - LINE;...;
-  // - ANN;T='...';
-  // - GET ...;
-  // Notes:
-  //  * LINE pattern is conservative: it matches up to the next semicolon.
-  //    If you later find LINE payloads can include semicolons, we can widen it.
+  // ✅ Validated against your EditedTENFAC1–4.ODB
   const TOKEN_RE = /(LINE;[^;\r\n]*;|ANN;T='[^']*';|GET [^;\r\n]*;)/g;
 
   function setStatus(msg, cls="muted") {
@@ -70,6 +198,7 @@
 
   function filterPrintable(bytes) {
     // Keep: tab(9), LF(10), CR(13), and ASCII 32..126
+    // Drop other binary/control bytes.
     let out = "";
     for (let i = 0; i < bytes.length; i++) {
       const b = bytes[i];
@@ -81,8 +210,7 @@
   }
 
   function extractTokens(text) {
-    const tokens = text.match(TOKEN_RE) || [];
-    return tokens;
+    return text.match(TOKEN_RE) || [];
   }
 
   function makeCRLF(lines) {
@@ -126,15 +254,13 @@
       const out = makeCRLF(tokens);
       lastOutput = out;
 
-      // output name: input base + .ODB
       const base = f.name.replace(/\.[^/.]+$/,"");
       lastOutName = `${base}.ODB`;
 
-      // preview first 300 lines
       const lines = tokens.slice(0, 300);
       previewEl.value = lines.join("\r\n") + (tokens.length > 300 ? "\r\n… (truncated preview)" : "");
 
-      countsEl.textContent = `Tokens: ${tokens.length} | Output: ${out.length.toLocaleString()} chars`;
+      countsEl.textContent = `Tokens: ${tokens.length.toLocaleString()} | Output: ${out.length.toLocaleString()} chars`;
       setStatus(`Converted OK → ${lastOutName}`, "ok");
       btnDownload.disabled = false;
     } catch (e) {
